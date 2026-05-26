@@ -1,8 +1,14 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import axios from 'axios';
 
+// Em dev usa /api com proxy. Em prod usa a URL do Render
+const isDev = import.meta.env.DEV;
+const API_BASE = isDev
+ ? '/api'
+  : `https://${import.meta.env.VITE_API_URL}/api`;
+
 const api = axios.create({
-  baseURL: '/api',
+  baseURL: API_BASE,
   timeout: 10000,
 });
 
@@ -14,6 +20,7 @@ export function useApi(endpoint, deps = [], pollInterval = 10000) {
 
   const fetchData = useCallback(async () => {
     try {
+      // endpoint já vem tipo '/price/0x...' sem o /api
       const res = await api.get(endpoint);
       if (mounted.current) {
         setData(res.data.data || res.data);
@@ -22,7 +29,7 @@ export function useApi(endpoint, deps = [], pollInterval = 10000) {
       }
     } catch (err) {
       if (mounted.current) {
-        setError(err.message);
+        setError(err.response?.data?.error || err.message);
         setLoading(false);
       }
     }
@@ -37,7 +44,7 @@ export function useApi(endpoint, deps = [], pollInterval = 10000) {
       mounted.current = false;
       clearInterval(interval);
     };
-  }, [fetchData, ...deps]);
+  }, [fetchData, pollInterval,...deps]); // add pollInterval nas deps
 
   return { data, loading, error, refetch: fetchData };
 }
