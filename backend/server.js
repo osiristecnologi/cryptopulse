@@ -230,22 +230,36 @@ app.get('/api/token/:address', sanitizeInput, async (req, res) => {
 app.get('/api/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
 // GET /api/price/:symbol
 app.get('/api/price/:symbol', sanitizeInput, async (req, res) => {
-  const symbol = req.params.symbol.toUpperCase()
+  const symbol = req.params.symbol.toUpperCase().replace('USDT', '')
 
   try {
-    // Tenta CoinGecko primeiro
-    const coinId = SYMBOL_MAP[symbol.replace('USDT', '')] || symbol.toLowerCase()
-    const data = await coingecko.getMarkets([coinId])
-    const coin = data[0]
+    // 1. Pega todos os markets do cache ou API
+    let markets
+    if (cache.has(CACHE_KEYS.MARKETS)) {
+      markets = cache.get(CACHE_KEYS.MARKETS)
+    } else {
+      markets = await coingecko.getMarkets()
+      cache.set(CACHE_KEYS.MARKETS, markets, 30)
+    }
 
-    if (!coin) return res.status(404).json({ error: 'Symbol not found' })
+    // 2. Acha o símbolo
+    const coin = markets.find(c =>
+      c.symbol.toUpperCase() === symbol ||
+      c.id === SYMBOL_MAP[symbol]
+    )
+
+    if (!coin) {
+      return res.status(404).json({ error: `Symbol ${symbol} not found` })
+    }
 
     res.json({
-      symbol: symbol,
+      symbol: req.params.symbol,
       price: coin.current_price.toString(),
-      priceChangePercent: coin.price_change_percentage_24h
+      priceChangePercent: coin.price_change_percentage_24h,
+      source: 'coingecko'
     })
   } catch (err) {
+    console.error('Price error:', err.message)
     res.status(500).json({ error: 'Failed to fetch price' })
   }
 })
