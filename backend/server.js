@@ -45,11 +45,39 @@ const SYMBOL_MAP = {
   ADA: 'cardano', SHIB: 'shiba-inu', AVAX: 'avalanche-2', DOT: 'polkadot',
   LINK: 'chainlink', MATIC: 'matic-network', UNI: 'uniswap', LTC: 'litecoin',
   PEPE: 'pepe', WIF: 'dogwifcoin', BONK: 'bonk', FLOKI: 'floki',
-  MEME: 'memecoin', POPCAT: 'popcat', GOAT: 'goatseus-maximus',
-  ARB: 'arbitrum', OP: 'optimism', SUI: 'sui', SEI: 'sei-network', TIA: 'celestia'
 };
 
 // ==================== HELPERS ====================
+// Cache global pra evitar 429 - 30s de duração
+const priceCache = new Map();
+
+async function getDexScreenerPrice(symbol) {
+  const cleanSymbol = symbol.toUpperCase().replace('USDT', '').replace('USD', '');
+
+  const { data } = await axios.get(
+    `https://api.dexscreener.com/latest/dex/search?q=${cleanSymbol}`,
+    { timeout: 5000 }
+  );
+
+  const pair = data.pairs?.find(p =>
+    p.baseToken.symbol.toUpperCase() === cleanSymbol &&
+    p.quoteToken.symbol === 'USDT' &&
+    p.liquidity?.usd > 10000 // só pares com liquidez
+  );
+
+  if (!pair) throw new Error(`Symbol ${symbol} not found on DexScreener`);
+
+  return {
+    symbol: symbol.toUpperCase(),
+    price: parseFloat(pair.priceUsd),
+    priceChangePercent: parseFloat(pair.priceChange?.h24 || 0),
+    volume: parseFloat(pair.volume?.h24 || 0),
+    marketCap: parseFloat(pair.fdv || 0),
+    liquidity: parseFloat(pair.liquidity?.usd || 0),
+    source: 'dexscreener'
+  };
+}
+
 async function getCoinGeckoPrice(symbol) {
   const cleanSymbol = symbol.toUpperCase().replace('USDT', '').replace('USD', '');
   const coinId = SYMBOL_MAP[cleanSymbol] || cleanSymbol.toLowerCase();
@@ -69,9 +97,7 @@ async function getCoinGeckoPrice(symbol) {
   );
 
   const coinData = data[coinId];
-  if (!coinData?.usd) {
-    throw new Error(`Symbol ${symbol} not found on CoinGecko`);
-  }
+  if (!coinData?.usd) throw new Error(`Symbol ${symbol} not found on CoinGecko`);
 
   return {
     symbol: symbol.toUpperCase(),
@@ -83,32 +109,6 @@ async function getCoinGeckoPrice(symbol) {
   };
 }
 
-async function getMarketsWithFallback() {
-  if (cache.has(CACHE_KEYS.MARKETS)) {
-    return { source: 'cache', data: cache.get(CACHE_KEYS.MARKETS) };
-  }
-
-  try {
-    const data = await coingecko.getMarkets();
-    cache.set(CACHE_KEYS.MARKETS, data, 30);
-    return { source: 'coingecko', data };
-  } catch (err) {
-    console.error('CoinGecko markets failed:', err.message);
-    const fallback = await dexscreener.searchPairs('bitcoin ethereum solana');
-    const data = fallback.pairs?.slice(0, 10).map(p => ({
-      id: p.baseToken.symbol.toLowerCase(),
-      symbol: p.baseToken.symbol.toUpperCase(),
-      name: p.baseToken.name,
-      current_price: parseFloat(p.priceUsd),
-      price_change_percentage_24h: p.priceChange?.h24 || 0,
-      total_volume: p.volume?.h24 || 0,
-      market_cap: p.fdv || 0,
-      image: p.info?.imageUrl || '',
-    })) || [];
-    return { source: 'dexscreener-fallback', data };
-  }
-}
-
 // ==================== ENDPOINTS ====================
 
 // GET /api/health
@@ -117,27 +117,48 @@ app.get('/api/health', (req, res) => {
     status: 'ok',
     uptime: process.uptime(),
     node: process.version,
-    timestamp: Date.now()
+    cacheSize: priceCache.size
   });
 });
 
-// GET /api/price/:symbol
+// GET /api/price/:symbol - DEXSCREENER PRIMEIRO
 app.get('/api/price/:symbol', sanitizeInput, async (req, res) => {
   const rawSymbol = req.params.symbol.toUpperCase();
   const cacheKey = `price_${rawSymbol}`;
 
   try {
-    if (cache.has(cacheKey)) {
-      const cached = cache.get(cacheKey);
-      return res.json({...cached, source: 'cache' });
+    // 1. Cache de 30s - evita 429
+    if (priceCache.has(cacheKey)) {
+      const { data, timestamp } = priceCache.get(cacheKey);
+      if (Date.now() - timestamp < 30000) {
+        return res.json({...data, source: 'cache' });
+      }
     }
 
+    // 2. Tenta DexScreener primeiro - sem rate limit
+    try {
+      const data = await getDexScreenerPrice(rawSymbol);
+      priceCache.set(cacheKey, { data, timestamp: Date.now() });
+      return res.json(data);
+    } catch (dsErr) {
+      console.warn(`DexScreener failed for ${rawSymbol}:`, dsErr.message);
+    }
+
+    // 3. Fallback CoinGecko se DexScreener falhar
     const data = await getCoinGeckoPrice(rawSymbol);
-    cache.set(cacheKey, data, 15); // Cache 15s pra evitar 429
+    priceCache.set(cacheKey, { data, timestamp: Date.now() });
     res.json(data);
+
   } catch (err) {
     console.error(`GET /api/price/${rawSymbol}:`, err.message);
-    const status = err.message.includes('not found')? 404 : 500;
+
+    // 4. Última tentativa: retorna cache antigo mesmo expirado
+    if (priceCache.has(cacheKey)) {
+      const { data } = priceCache.get(cacheKey);
+      return res.json({...data, source: 'stale-cache' });
+    }
+
+    const status = err.message.includes('not found')? 404 : 503;
     res.status(status).json({
       error: 'Failed to fetch price',
       detail: err.message
@@ -148,8 +169,12 @@ app.get('/api/price/:symbol', sanitizeInput, async (req, res) => {
 // GET /api/markets
 app.get('/api/markets', async (req, res) => {
   try {
-    const { source, data } = await getMarketsWithFallback();
-    res.json({ source, data });
+    if (cache.has(CACHE_KEYS.MARKETS)) {
+      return res.json({ source: 'cache', data: cache.get(CACHE_KEYS.MARKETS) });
+    }
+    const data = await coingecko.getMarkets();
+    cache.set(CACHE_KEYS.MARKETS, data, 60); // 60s cache
+    res.json({ source: 'coingecko', data });
   } catch (err) {
     const cached = cache.get(CACHE_KEYS.MARKETS);
     if (cached) return res.json({ source: 'cache-fallback', data: cached });
@@ -157,7 +182,7 @@ app.get('/api/markets', async (req, res) => {
   }
 });
 
-// GET /api/chart/:symbol
+// Demais rotas iguais...
 app.get('/api/chart/:symbol', sanitizeInput, async (req, res) => {
   const symbol = req.params.symbol.toUpperCase();
   const interval = req.query.interval || '1h';
@@ -187,108 +212,12 @@ app.get('/api/chart/:symbol', sanitizeInput, async (req, res) => {
       close: d[4] || 0,
     })).filter(d => d.open > 0);
 
-    cache.set(cacheKey, formatted, 15);
+    cache.set(cacheKey, formatted, 30);
     res.json({ source: 'coingecko', data: formatted });
   } catch (err) {
     const cached = cache.get(cacheKey);
     if (cached) return res.json({ source: 'cache-fallback', data: cached });
     res.status(500).json({ error: 'Failed to fetch chart', data: [] });
-  }
-});
-
-// GET /api/search?q=
-app.get('/api/search', sanitizeInput, async (req, res) => {
-  const query = req.query.q?.trim();
-  if (!query || query.length < 2) return res.json({ coins: [], pairs: [] });
-
-  const cacheKey = CACHE_KEYS.SEARCH(query);
-  try {
-    if (cache.has(cacheKey)) return res.json(cache.get(cacheKey));
-
-    const [cgResult, dsResult] = await Promise.allSettled([
-      coingecko.searchCoins(query),
-      dexscreener.searchPairs(query),
-    ]);
-
-    const result = {
-      coins: cgResult.status === 'fulfilled'? (cgResult.value.coins || []) : [],
-      pairs: dsResult.status === 'fulfilled'? (dsResult.value.pairs || []) : [],
-    };
-
-    cache.set(cacheKey, result, 60);
-    res.json(result);
-  } catch {
-    res.json({ coins: [], pairs: [] });
-  }
-});
-
-// GET /api/trending-memes
-app.get('/api/trending-memes', async (req, res) => {
-  try {
-    if (cache.has(CACHE_KEYS.TRENDING)) {
-      return res.json({ source: 'cache', data: cache.get(CACHE_KEYS.TRENDING) });
-    }
-
-    let data = [];
-    try {
-      const trending = await dexscreener.getTrending();
-      data = trending || [];
-    } catch (err) {
-      console.error('DexScreener trending failed:', err.message);
-    }
-
-    const enriched = data.map(p => ({
-      name: p.baseToken?.name || 'Unknown',
-      symbol: p.baseToken?.symbol || '???',
-      price: parseFloat(p.priceUsd || 0),
-      priceChange24h: parseFloat(p.priceChange?.h24 || 0),
-      volume24h: parseFloat(p.volume?.h24 || 0),
-      liquidity: parseFloat(p.liquidity?.usd || 0),
-      marketCap: parseFloat(p.fdv || 0),
-      chain: p.chainId || 'unknown',
-      address: p.pairAddress || '',
-      url: p.url || '',
-      image: p.info?.imageUrl || '',
-    }));
-
-    cache.set(CACHE_KEYS.TRENDING, enriched, 15);
-    res.json({ source: 'dexscreener', data: enriched });
-  } catch (err) {
-    const cached = cache.get(CACHE_KEYS.TRENDING);
-    if (cached) return res.json({ source: 'cache-fallback', data: cached });
-    res.status(500).json({ error: 'Failed to fetch trending', data: [] });
-  }
-});
-
-// GET /api/token/:address
-app.get('/api/token/:address', sanitizeInput, async (req, res) => {
-  const address = req.params.address;
-  const cacheKey = CACHE_KEYS.TOKEN(address);
-
-  try {
-    if (cache.has(cacheKey)) return res.json(cache.get(cacheKey));
-
-    const pairs = await dexscreener.getTokenPairs(address);
-    const data = pairs.pairs?.[0];
-    if (!data) return res.status(404).json({ error: 'Token not found' });
-
-    const enriched = {
-      name: data.baseToken?.name,
-      symbol: data.baseToken?.symbol,
-      price: parseFloat(data.priceUsd || 0),
-      priceChange24h: parseFloat(data.priceChange?.h24 || 0),
-      volume24h: parseFloat(data.volume?.h24 || 0),
-      liquidity: parseFloat(data.liquidity?.usd || 0),
-      chain: data.chainId,
-      address: data.pairAddress,
-      image: data.info?.imageUrl || '',
-    };
-
-    cache.set(cacheKey, enriched, 15);
-    res.json(enriched);
-  } catch (err) {
-    console.error('Token error:', err.message);
-    res.status(500).json({ error: 'Failed to fetch token' });
   }
 });
 
@@ -299,5 +228,5 @@ app.use('/api/*', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🚀 CryptoPulse Backend running on port ${PORT}`);
-  console.log(`Node ${process.version} | Env: ${process.env.NODE_ENV || 'dev'}`);
+  console.log(`Node ${process.version}`);
 });
