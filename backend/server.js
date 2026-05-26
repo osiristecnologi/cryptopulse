@@ -10,30 +10,34 @@ import * as dexscreener from './services/dexscreener.js';
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-// Security
+// ==================== MIDDLEWARES ====================
 app.use(helmet());
-app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:3000'], credentials: false }));
+app.use(cors({
+  origin: [
+    'http://localhost:5173',
+    'http://localhost:3000',
+    'https://cryptopulse-yy4l.onrender.com'
+  ],
+  credentials: false
+}));
 app.use(express.json({ limit: '10kb' }));
 
-// Rate limiting
 const limiter = rateLimit({
   windowMs: 60 * 1000,
   max: 60,
   message: { error: 'Too many requests, please try again later.' },
-  standardHeaders: true,
-  legacyHeaders: false,
 });
 app.use('/api/', limiter);
 
-// Sanitize middleware
 const sanitizeInput = (req, res, next) => {
-  if (req.query?.q) req.query.q = sanitizeHtml(req.query.q, { allowedTags: [], allowedAttributes: {} });
-  if (req.params?.symbol) req.params.symbol = sanitizeHtml(req.params.symbol, { allowedTags: [], allowedAttributes: {} });
-  if (req.params?.address) req.params.address = sanitizeHtml(req.params.address, { allowedTags: [], allowedAttributes: {} });
+  const sanitize = (val) => sanitizeHtml(val, { allowedTags: [], allowedAttributes: {} });
+  if (req.query?.q) req.query.q = sanitize(req.query.q);
+  if (req.params?.symbol) req.params.symbol = sanitize(req.params.symbol);
+  if (req.params?.address) req.params.address = sanitize(req.params.address);
   next();
 };
 
-// COINGECKO SYMBOL MAP
+// ==================== CONSTANTS ====================
 const SYMBOL_MAP = {
   BTC: 'bitcoin', ETH: 'ethereum', SOL: 'solana', BNB: 'binancecoin',
   DOGE: 'dogecoin', SHIB: 'shiba-inu', PEPE: 'pepe', XRP: 'ripple',
@@ -45,35 +49,59 @@ const SYMBOL_MAP = {
   FLOKI: 'floki', MEME: 'memecoin', POPCAT: 'popcat', GOAT: 'goatseus-maximus',
 };
 
+// ==================== HELPERS ====================
+async function getMarketsWithFallback() {
+  if (cache.has(CACHE_KEYS.MARKETS)) {
+    return { source: 'cache', data: cache.get(CACHE_KEYS.MARKETS) };
+  }
+
+  try {
+    const data = await coingecko.getMarkets();
+    cache.set(CACHE_KEYS.MARKETS, data, 30);
+    return { source: 'coingecko', data };
+  } catch (err) {
+    console.error('CoinGecko failed:', err.message);
+    const fallback = await dexscreener.searchPairs('bitcoin ethereum solana bnb');
+    const data = fallback.pairs?.slice(0, 10).map(p => ({
+      id: p.baseToken.symbol.toLowerCase(),
+      symbol: p.baseToken.symbol.toUpperCase(),
+      name: p.baseToken.name,
+      current_price: parseFloat(p.priceUsd),
+      price_change_percentage_24h: p.priceChange?.h24 || 0,
+      total_volume: p.volume?.h24 || 0,
+      market_cap: p.fdv || 0,
+      image: p.info?.imageUrl || '',
+    })) || [];
+    return { source: 'dexscreener-fallback', data };
+  }
+}
+
+async function getBinancePrice(symbol) {
+  const binanceSymbol = symbol.includes('USDT')? symbol : `${symbol}USDT`;
+  const res = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${binanceSymbol}`);
+  if (!res.ok) throw new Error(`Binance: ${binanceSymbol} not found`);
+  const data = await res.json();
+  return {
+    symbol: data.symbol,
+    price: parseFloat(data.lastPrice),
+    priceChangePercent: parseFloat(data.priceChangePercent),
+    volume: parseFloat(data.volume),
+    source: 'binance'
+  };
+}
+
 // ==================== ENDPOINTS ====================
+
+// GET /api/health
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', uptime: process.uptime(), timestamp: Date.now() });
+});
 
 // GET /api/markets
 app.get('/api/markets', async (req, res) => {
   try {
-    if (cache.has(CACHE_KEYS.MARKETS)) {
-      return res.json({ source: 'cache', data: cache.get(CACHE_KEYS.MARKETS) });
-    }
-
-    let data;
-    try {
-      data = await coingecko.getMarkets();
-    } catch {
-      // Fallback: try DexScreener for main coins
-      const fallback = await dexscreener.searchPairs('bitcoin ethereum solana bnb');
-      data = fallback.pairs?.slice(0, 4).map(p => ({
-        id: p.baseToken.symbol.toLowerCase(),
-        symbol: p.baseToken.symbol.toUpperCase(),
-        name: p.baseToken.name,
-        current_price: parseFloat(p.priceUsd),
-        price_change_percentage_24h: p.priceChange?.h24 || 0,
-        total_volume: p.volume?.h24 || 0,
-        market_cap: p.liquidity?.usd || 0,
-        image: p.info?.imageUrl || '',
-      })) || [];
-    }
-
-    cache.set(CACHE_KEYS.MARKETS, data, 30);
-    res.json({ source: 'coingecko', data });
+    const { source, data } = await getMarketsWithFallback();
+    res.json({ source, data });
   } catch (err) {
     const cached = cache.get(CACHE_KEYS.MARKETS);
     if (cached) return res.json({ source: 'cache-fallback', data: cached });
@@ -81,8 +109,40 @@ app.get('/api/markets', async (req, res) => {
   }
 });
 
+// GET /api/price/:symbol - COM FALLBACK BINANCE
+app.get('/api/price/:symbol', sanitizeInput, async (req, res) => {
+  const rawSymbol = req.params.symbol.toUpperCase();
+  const cleanSymbol = rawSymbol.replace('USDT', '');
+
+  try {
+    // 1. Tenta CoinGecko via cache/markets
+    const { data: markets } = await getMarketsWithFallback();
+    const coin = markets.find(c =>
+      c.symbol.toUpperCase() === cleanSymbol ||
+      c.id === SYMBOL_MAP[cleanSymbol]
+    );
+
+    if (coin) {
+      return res.json({
+        symbol: rawSymbol,
+        price: coin.current_price,
+        priceChangePercent: coin.price_change_percentage_24h,
+        source: 'coingecko'
+      });
+    }
+
+    // 2. Fallback Binance - nunca falha pra majors
+    const binanceData = await getBinancePrice(rawSymbol);
+    return res.json(binanceData);
+
+  } catch (err) {
+    console.error(`GET /api/price/${rawSymbol} ERROR:`, err.message);
+    res.status(500).json({ error: 'Failed to fetch price', detail: err.message });
+  }
+});
+
 // GET /api/chart/:symbol
-app.get('/api/chart/:symbol', async (req, res) => {
+app.get('/api/chart/:symbol', sanitizeInput, async (req, res) => {
   const symbol = req.params.symbol.toUpperCase();
   const interval = req.query.interval || '1h';
   const cacheKey = CACHE_KEYS.CHART(`${symbol}_${interval}`);
@@ -93,23 +153,16 @@ app.get('/api/chart/:symbol', async (req, res) => {
     }
 
     const coinId = SYMBOL_MAP[symbol] || symbol.toLowerCase();
-    const days = interval === '1m' ? 1 : interval === '5m' ? 1 : interval === '15m' ? 3 : interval === '30m' ? 5 : 7;
+    const days = { '1m': 1, '5m': 1, '15m': 3, '30m': 5, '1h': 7 }[interval] || 7;
 
     let data;
     try {
       data = await coingecko.getOhlcv(coinId, days);
     } catch {
-      // Fallback to DexScreener
       const pairs = await dexscreener.searchPairs(coinId);
-      const pair = pairs.pairs?.[0];
-      if (pair?.info?.pairData) {
-        data = pair.info.pairData;
-      } else {
-        data = [];
-      }
+      data = pairs.pairs?.[0]?.info?.pairData || [];
     }
 
-    // Format OHLCV for Lightweight Charts
     const formatted = (data || []).map(d => ({
       time: Math.floor((d[0] || Date.now()) / 1000),
       open: d[1] || 0,
@@ -142,8 +195,8 @@ app.get('/api/search', sanitizeInput, async (req, res) => {
     ]);
 
     const result = {
-      coins: cgResult.status === 'fulfilled' ? (cgResult.value.coins || []) : [],
-      pairs: dsResult.status === 'fulfilled' ? (dsResult.value.pairs || []) : [],
+      coins: cgResult.status === 'fulfilled'? (cgResult.value.coins || []) : [],
+      pairs: dsResult.status === 'fulfilled'? (dsResult.value.pairs || []) : [],
     };
 
     cache.set(cacheKey, result, 60);
@@ -160,14 +213,14 @@ app.get('/api/trending-memes', async (req, res) => {
       return res.json({ source: 'cache', data: cache.get(CACHE_KEYS.TRENDING) });
     }
 
-    let data;
+    let data = [];
     try {
-      data = await dexscreener.getTrending();
-    } catch {
-      data = [];
+      const trending = await dexscreener.getTrending();
+      data = trending || [];
+    } catch (err) {
+      console.error('DexScreener trending failed:', err.message);
     }
 
-    // Enrich with CoinGecko data if available
     const enriched = data.map(p => ({
       name: p.baseToken?.name || 'Unknown',
       symbol: p.baseToken?.symbol || '???',
@@ -175,7 +228,7 @@ app.get('/api/trending-memes', async (req, res) => {
       priceChange24h: parseFloat(p.priceChange?.h24 || 0),
       volume24h: parseFloat(p.volume?.h24 || 0),
       liquidity: parseFloat(p.liquidity?.usd || 0),
-      marketCap: parseFloat(p.fdv || p.liquidity?.usd || 0),
+      marketCap: parseFloat(p.fdv || 0),
       chain: p.chainId || 'unknown',
       address: p.pairAddress || '',
       url: p.url || '',
@@ -203,8 +256,7 @@ app.get('/api/token/:address', sanitizeInput, async (req, res) => {
     if (cache.has(cacheKey)) return res.json(cache.get(cacheKey));
 
     const pairs = await dexscreener.getTokenPairs(address);
-    const data = pairs.pairs?.[0] || null;
-
+    const data = pairs.pairs?.[0];
     if (!data) return res.status(404).json({ error: 'Token not found' });
 
     const enriched = {
@@ -221,46 +273,15 @@ app.get('/api/token/:address', sanitizeInput, async (req, res) => {
 
     cache.set(cacheKey, enriched, 15);
     res.json(enriched);
-  } catch {
+  } catch (err) {
+    console.error('Token error:', err.message);
     res.status(500).json({ error: 'Failed to fetch token' });
   }
 });
 
-// Health check
-app.get('/api/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
-// GET /api/price/:symbol
-app.get('/api/price/:symbol', sanitizeInput, async (req, res) => {
-  const symbol = req.params.symbol.toUpperCase().replace('USDT', '')
+// 404 handler
+app.use('/api/*', (req, res) => {
+  res.status(404).json({ error: `Route ${req.path} not found` });
+});
 
-  try {
-    // 1. Pega todos os markets do cache ou API
-    let markets
-    if (cache.has(CACHE_KEYS.MARKETS)) {
-      markets = cache.get(CACHE_KEYS.MARKETS)
-    } else {
-      markets = await coingecko.getMarkets()
-      cache.set(CACHE_KEYS.MARKETS, markets, 30)
-    }
-
-    // 2. Acha o símbolo
-    const coin = markets.find(c =>
-      c.symbol.toUpperCase() === symbol ||
-      c.id === SYMBOL_MAP[symbol]
-    )
-
-    if (!coin) {
-      return res.status(404).json({ error: `Symbol ${symbol} not found` })
-    }
-
-    res.json({
-      symbol: req.params.symbol,
-      price: coin.current_price.toString(),
-      priceChangePercent: coin.price_change_percentage_24h,
-      source: 'coingecko'
-    })
-  } catch (err) {
-    console.error('Price error:', err.message)
-    res.status(500).json({ error: 'Failed to fetch price' })
-  }
-})
 app.listen(PORT, () => console.log(`🚀 CryptoPulse Backend running on port ${PORT}`));
