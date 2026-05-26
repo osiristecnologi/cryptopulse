@@ -3,7 +3,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import sanitizeHtml from 'sanitize-html';
-import axios from 'axios'; // USA AXIOS
+import axios from 'axios';
 import { cache, CACHE_KEYS } from './services/cache.js';
 import * as coingecko from './services/coingecko.js';
 import * as dexscreener from './services/dexscreener.js';
@@ -41,35 +41,71 @@ const sanitizeInput = (req, res, next) => {
 // ==================== CONSTANTS ====================
 const SYMBOL_MAP = {
   BTC: 'bitcoin', ETH: 'ethereum', SOL: 'solana', BNB: 'binancecoin',
-  DOGE: 'dogecoin', SHIB: 'shiba-inu', PEPE: 'pepe', XRP: 'ripple',
-  ADA: 'cardano', AVAX: 'avalanche-2', MATIC: 'matic-network',
-  DOT: 'polkadot', LINK: 'chainlink', UNI: 'uniswap', AAVE: 'aave',
+  USDT: 'tether', USDC: 'usd-coin', XRP: 'ripple', DOGE: 'dogecoin',
+  ADA: 'cardano', SHIB: 'shiba-inu', AVAX: 'avalanche-2', DOT: 'polkadot',
+  LINK: 'chainlink', MATIC: 'matic-network', UNI: 'uniswap', LTC: 'litecoin',
+  PEPE: 'pepe', WIF: 'dogwifcoin', BONK: 'bonk', FLOKI: 'floki',
+  MEME: 'memecoin', POPCAT: 'popcat', GOAT: 'goatseus-maximus',
+  ARB: 'arbitrum', OP: 'optimism', SUI: 'sui', SEI: 'sei-network', TIA: 'celestia'
 };
 
 // ==================== HELPERS ====================
-async function getBinancePrice(symbol) {
-  const binanceSymbol = symbol.includes('USDT')? symbol : `${symbol}USDT`;
-  
-  try {
-    const { data } = await axios.get(
-      `https://api.binance.com/api/v3/ticker/24hr?symbol=${binanceSymbol}`,
-      { timeout: 5000 }
-    );
-    
-    return {
-      symbol: data.symbol,
-      price: parseFloat(data.lastPrice),
-      priceChangePercent: parseFloat(data.priceChangePercent),
-      volume: parseFloat(data.volume),
-      high: parseFloat(data.highPrice),
-      low: parseFloat(data.lowPrice),
-      source: 'binance'
-    };
-  } catch (err) {
-    if (err.response?.status === 400) {
-      throw new Error(`Symbol ${binanceSymbol} not found on Binance`);
+async function getCoinGeckoPrice(symbol) {
+  const cleanSymbol = symbol.toUpperCase().replace('USDT', '').replace('USD', '');
+  const coinId = SYMBOL_MAP[cleanSymbol] || cleanSymbol.toLowerCase();
+
+  const { data } = await axios.get(
+    'https://api.coingecko.com/api/v3/simple/price',
+    {
+      params: {
+        ids: coinId,
+        vs_currencies: 'usd',
+        include_24hr_change: true,
+        include_24hr_vol: true,
+        include_market_cap: true
+      },
+      timeout: 5000
     }
-    throw new Error(`Binance API error: ${err.message}`);
+  );
+
+  const coinData = data[coinId];
+  if (!coinData?.usd) {
+    throw new Error(`Symbol ${symbol} not found on CoinGecko`);
+  }
+
+  return {
+    symbol: symbol.toUpperCase(),
+    price: coinData.usd,
+    priceChangePercent: coinData.usd_24h_change || 0,
+    volume: coinData.usd_24h_vol || 0,
+    marketCap: coinData.usd_market_cap || 0,
+    source: 'coingecko'
+  };
+}
+
+async function getMarketsWithFallback() {
+  if (cache.has(CACHE_KEYS.MARKETS)) {
+    return { source: 'cache', data: cache.get(CACHE_KEYS.MARKETS) };
+  }
+
+  try {
+    const data = await coingecko.getMarkets();
+    cache.set(CACHE_KEYS.MARKETS, data, 30);
+    return { source: 'coingecko', data };
+  } catch (err) {
+    console.error('CoinGecko markets failed:', err.message);
+    const fallback = await dexscreener.searchPairs('bitcoin ethereum solana');
+    const data = fallback.pairs?.slice(0, 10).map(p => ({
+      id: p.baseToken.symbol.toLowerCase(),
+      symbol: p.baseToken.symbol.toUpperCase(),
+      name: p.baseToken.name,
+      current_price: parseFloat(p.priceUsd),
+      price_change_percentage_24h: p.priceChange?.h24 || 0,
+      total_volume: p.volume?.h24 || 0,
+      market_cap: p.fdv || 0,
+      image: p.info?.imageUrl || '',
+    })) || [];
+    return { source: 'dexscreener-fallback', data };
   }
 }
 
@@ -77,30 +113,33 @@ async function getBinancePrice(symbol) {
 
 // GET /api/health
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime(), node: process.version });
+  res.json({
+    status: 'ok',
+    uptime: process.uptime(),
+    node: process.version,
+    timestamp: Date.now()
+  });
 });
 
-// GET /api/test-binance - testa conexão
-app.get('/api/test-binance', async (req, res) => {
-  try {
-    const { data } = await axios.get('https://api.binance.com/api/v3/ping', { timeout: 3000 });
-    res.json({ binance: true, data });
-  } catch (e) {
-    res.status(500).json({ binance: false, error: e.message });
-  }
-});
-
-// GET /api/price/:symbol - USA AXIOS
+// GET /api/price/:symbol
 app.get('/api/price/:symbol', sanitizeInput, async (req, res) => {
   const rawSymbol = req.params.symbol.toUpperCase();
-  
+  const cacheKey = `price_${rawSymbol}`;
+
   try {
-    const binanceData = await getBinancePrice(rawSymbol);
-    return res.json(binanceData);
+    if (cache.has(cacheKey)) {
+      const cached = cache.get(cacheKey);
+      return res.json({...cached, source: 'cache' });
+    }
+
+    const data = await getCoinGeckoPrice(rawSymbol);
+    cache.set(cacheKey, data, 15); // Cache 15s pra evitar 429
+    res.json(data);
   } catch (err) {
-    console.error(`GET /api/price/${rawSymbol} ERROR:`, err.message);
-    res.status(500).json({ 
-      error: 'Failed to fetch price', 
+    console.error(`GET /api/price/${rawSymbol}:`, err.message);
+    const status = err.message.includes('not found')? 404 : 500;
+    res.status(status).json({
+      error: 'Failed to fetch price',
       detail: err.message
     });
   }
@@ -109,14 +148,147 @@ app.get('/api/price/:symbol', sanitizeInput, async (req, res) => {
 // GET /api/markets
 app.get('/api/markets', async (req, res) => {
   try {
-    if (cache.has(CACHE_KEYS.MARKETS)) {
-      return res.json({ source: 'cache', data: cache.get(CACHE_KEYS.MARKETS) });
-    }
-    const data = await coingecko.getMarkets();
-    cache.set(CACHE_KEYS.MARKETS, data, 30);
-    res.json({ source: 'coingecko', data });
+    const { source, data } = await getMarketsWithFallback();
+    res.json({ source, data });
   } catch (err) {
+    const cached = cache.get(CACHE_KEYS.MARKETS);
+    if (cached) return res.json({ source: 'cache-fallback', data: cached });
     res.status(500).json({ error: 'Failed to fetch markets', data: [] });
+  }
+});
+
+// GET /api/chart/:symbol
+app.get('/api/chart/:symbol', sanitizeInput, async (req, res) => {
+  const symbol = req.params.symbol.toUpperCase();
+  const interval = req.query.interval || '1h';
+  const cacheKey = CACHE_KEYS.CHART(`${symbol}_${interval}`);
+
+  try {
+    if (cache.has(cacheKey)) {
+      return res.json({ source: 'cache', data: cache.get(cacheKey) });
+    }
+
+    const coinId = SYMBOL_MAP[symbol] || symbol.toLowerCase();
+    const days = { '1m': 1, '5m': 1, '15m': 3, '30m': 5, '1h': 7 }[interval] || 7;
+
+    let data;
+    try {
+      data = await coingecko.getOhlcv(coinId, days);
+    } catch {
+      const pairs = await dexscreener.searchPairs(coinId);
+      data = pairs.pairs?.[0]?.info?.pairData || [];
+    }
+
+    const formatted = (data || []).map(d => ({
+      time: Math.floor((d[0] || Date.now()) / 1000),
+      open: d[1] || 0,
+      high: d[2] || 0,
+      low: d[3] || 0,
+      close: d[4] || 0,
+    })).filter(d => d.open > 0);
+
+    cache.set(cacheKey, formatted, 15);
+    res.json({ source: 'coingecko', data: formatted });
+  } catch (err) {
+    const cached = cache.get(cacheKey);
+    if (cached) return res.json({ source: 'cache-fallback', data: cached });
+    res.status(500).json({ error: 'Failed to fetch chart', data: [] });
+  }
+});
+
+// GET /api/search?q=
+app.get('/api/search', sanitizeInput, async (req, res) => {
+  const query = req.query.q?.trim();
+  if (!query || query.length < 2) return res.json({ coins: [], pairs: [] });
+
+  const cacheKey = CACHE_KEYS.SEARCH(query);
+  try {
+    if (cache.has(cacheKey)) return res.json(cache.get(cacheKey));
+
+    const [cgResult, dsResult] = await Promise.allSettled([
+      coingecko.searchCoins(query),
+      dexscreener.searchPairs(query),
+    ]);
+
+    const result = {
+      coins: cgResult.status === 'fulfilled'? (cgResult.value.coins || []) : [],
+      pairs: dsResult.status === 'fulfilled'? (dsResult.value.pairs || []) : [],
+    };
+
+    cache.set(cacheKey, result, 60);
+    res.json(result);
+  } catch {
+    res.json({ coins: [], pairs: [] });
+  }
+});
+
+// GET /api/trending-memes
+app.get('/api/trending-memes', async (req, res) => {
+  try {
+    if (cache.has(CACHE_KEYS.TRENDING)) {
+      return res.json({ source: 'cache', data: cache.get(CACHE_KEYS.TRENDING) });
+    }
+
+    let data = [];
+    try {
+      const trending = await dexscreener.getTrending();
+      data = trending || [];
+    } catch (err) {
+      console.error('DexScreener trending failed:', err.message);
+    }
+
+    const enriched = data.map(p => ({
+      name: p.baseToken?.name || 'Unknown',
+      symbol: p.baseToken?.symbol || '???',
+      price: parseFloat(p.priceUsd || 0),
+      priceChange24h: parseFloat(p.priceChange?.h24 || 0),
+      volume24h: parseFloat(p.volume?.h24 || 0),
+      liquidity: parseFloat(p.liquidity?.usd || 0),
+      marketCap: parseFloat(p.fdv || 0),
+      chain: p.chainId || 'unknown',
+      address: p.pairAddress || '',
+      url: p.url || '',
+      image: p.info?.imageUrl || '',
+    }));
+
+    cache.set(CACHE_KEYS.TRENDING, enriched, 15);
+    res.json({ source: 'dexscreener', data: enriched });
+  } catch (err) {
+    const cached = cache.get(CACHE_KEYS.TRENDING);
+    if (cached) return res.json({ source: 'cache-fallback', data: cached });
+    res.status(500).json({ error: 'Failed to fetch trending', data: [] });
+  }
+});
+
+// GET /api/token/:address
+app.get('/api/token/:address', sanitizeInput, async (req, res) => {
+  const address = req.params.address;
+  const cacheKey = CACHE_KEYS.TOKEN(address);
+
+  try {
+    if (cache.has(cacheKey)) return res.json(cache.get(cacheKey));
+
+    const pairs = await dexscreener.getTokenPairs(address);
+    const data = pairs.pairs?.[0];
+    if (!data) return res.status(404).json({ error: 'Token not found' });
+
+    const enriched = {
+      name: data.baseToken?.name,
+      symbol: data.baseToken?.symbol,
+      price: parseFloat(data.priceUsd || 0),
+      priceChange24h: parseFloat(data.priceChange?.h24 || 0),
+      volume24h: parseFloat(data.volume?.h24 || 0),
+      liquidity: parseFloat(data.liquidity?.usd || 0),
+      chain: data.chainId,
+      address: data.pairAddress,
+      image: data.info?.imageUrl || '',
+    };
+
+    cache.set(cacheKey, enriched, 15);
+    res.json(enriched);
+  } catch (err) {
+    console.error('Token error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch token' });
   }
 });
 
@@ -125,4 +297,7 @@ app.use('/api/*', (req, res) => {
   res.status(404).json({ error: `Route ${req.path} not found` });
 });
 
-app.listen(PORT, () => console.log(`🚀 Backend on ${PORT} | Node ${process.version}`));
+app.listen(PORT, () => {
+  console.log(`🚀 CryptoPulse Backend running on port ${PORT}`);
+  console.log(`Node ${process.version} | Env: ${process.env.NODE_ENV || 'dev'}`);
+});
