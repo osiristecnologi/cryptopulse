@@ -1,1 +1,54 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
 
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: #0a0a0f;
+  color: #e0e0e0;
+  font-family: 'Inter', system-ui, sans-serif;
+  -webkit-tap-highlight-color: transparent;
+  scrollbar-width: thin;
+  scrollbar-color: #2a2a3e #0a0a0f;
+}
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #0a0a0f; }
+::-webkit-scrollbar-thumb { background: #2a2a3e; border-radius: 3px; }
+
+.neon-text-blue { text-shadow: 0 0 10px rgba(0,212,255,0.5); }
+.neon-text-green { text-shadow: 0 0 10px rgba(0,255,136,0.5); }
+.neon-border { box-shadow: 0 0 15px rgba(0,212,255,0.1); }
+
+.glass {
+  background: rgba(18,18,26,0.85);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255,255,255,0.06);
+}
+
+.shimmer-bg {
+  background: linear-gradient(90deg, #1a1a2e 25%, #2a2a3e 50%, #1a1a2e 75%);
+  background-size: 200% 100%;
+  animation: shimmer 2s infinite linear;
+}
+
+@keyframes priceFlash {
+  0% { background-color: transparent; }
+  30% { background-color: rgba(0,255,136,0.2); }
+  100% { background-color: transparent; }
+}
+
+.price-up { animation: priceFlash 0.6s ease-out; }
+
+@keyframes priceFlashRed {
+  0% { background-color: transparent; }
+  30% { background-color: rgba(255,0,110,0.2); }
+  100% { background-color: transparent; }
+}
+
+.price-down { animation: priceFlashRed 0.6s ease-out; }
+
+.glow-green { box-shadow: 0 0 20px rgba(0,255,136,0.3); }
+.glow-blue { box-shadow: 0 0 20px rgba(0,212,255,0.3); }
