@@ -228,5 +228,25 @@ app.get('/api/token/:address', sanitizeInput, async (req, res) => {
 
 // Health check
 app.get('/api/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
+// GET /api/price/:symbol
+app.get('/api/price/:symbol', sanitizeInput, async (req, res) => {
+  const symbol = req.params.symbol.toUpperCase()
 
+  try {
+    // Tenta CoinGecko primeiro
+    const coinId = SYMBOL_MAP[symbol.replace('USDT', '')] || symbol.toLowerCase()
+    const data = await coingecko.getMarkets([coinId])
+    const coin = data[0]
+
+    if (!coin) return res.status(404).json({ error: 'Symbol not found' })
+
+    res.json({
+      symbol: symbol,
+      price: coin.current_price.toString(),
+      priceChangePercent: coin.price_change_percentage_24h
+    })
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch price' })
+  }
+})
 app.listen(PORT, () => console.log(`🚀 CryptoPulse Backend running on port ${PORT}`));
